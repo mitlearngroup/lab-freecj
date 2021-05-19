@@ -1,29 +1,91 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
-
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
 type Master struct {
 	// Your definitions here.
-
+	lk            sync.Mutex
+	status        string
+	taskState     map[string]Task
+	taskAvailable chan Task
+	nMap          int
+	nReduce       int
+	nTask         int
 }
 
-// Your code here -- RPC handlers for the worker to call.
+func genKey(t string, i int) string {
+	return fmt.Sprintf("%s-%d", t, i)
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (m *Master) trasistion() {
+	if m.status == TaskMap {
+		m.status = TaskReduce
+		for i := 0; i < m.nReduce; i++ {
+			t := Task{
+				Type:      TaskReduce,
+				TaskIndex: i,
+			}
+			m.taskState[genKey(TaskReduce, i)] = t
+			m.taskAvailable <- t
+		}
+
+	} else if m.status == TaskReduce {
+		m.status = ""
+		close(m.taskAvailable)
+	}
+
+}
+func (m *Master) Handler(args *AssignTaskRequest, reply *AssignTaskReponse) error {
+
+	if args.LastTaskType != "" {
+		key := genKey(args.LastTaskType, args.LastTaskId)
+		m.lk.Lock()
+		defer m.lk.Unlock()
+		if val, ok := m.taskState[key]; ok && val.WorkerId == args.WorkerId {
+			delete(m.taskState, key)
+
+			if len(m.taskState) == 0 {
+				m.trasistion()
+			}
+		}
+		return nil
+	}
+
+	t := <-m.taskAvailable
+	key := genKey(t.Type, t.TaskIndex)
+	t.WorkerId = args.WorkerId
+
+	reply.MapCnt = m.nMap
+	reply.ReduceCnt = m.nReduce
+	reply.ToDoTask = t
+
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	m.taskState[key] = t
+
+	go func() {
+
+		time.Sleep(10 * time.Second)
+		m.lk.Lock()
+		defer m.lk.Unlock()
+		if _, ok := m.taskState[key]; ok {
+			t.WorkerId = ""
+			m.taskState[key] = t
+			m.taskAvailable <- t
+		}
+
+	}()
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -46,12 +108,9 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	m.lk.Lock()
+	defer m.lk.Unlock()
+	return m.status == ""
 }
 
 //
@@ -60,11 +119,26 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	m := Master{
+		status:        TaskMap,
+		taskState:     make(map[string]Task),
+		taskAvailable: make(chan Task, len(files)*nReduce),
+		nMap:          (len(files)),
+		nReduce:       (nReduce),
+	}
+
+	for i, f := range files {
+		t := Task{
+			Type:      TaskMap,
+			TaskIndex: i,
+			MapFile:   f, // file for map task
+		}
+		m.taskState[genKey(TaskMap, i)] = t
+		m.taskAvailable <- t
+	}
 
 	// Your code here.
-
-
 	m.server()
+
 	return &m
 }
